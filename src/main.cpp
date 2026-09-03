@@ -37,6 +37,11 @@ using engine::graphics::vulkan::rendering::GraphicsState;
 using engine::graphics::vulkan::rendering::PushConstantRange;
 using engine::graphics::vulkan::rendering::PushConstantWrite;
 using engine::graphics::vulkan::rendering::RenderingContext;
+using engine::graphics::vulkan::rendering::ResourceDepthTarget;
+using engine::graphics::vulkan::resources::Image;
+using engine::graphics::vulkan::resources::ImageCreateInfo;
+using engine::graphics::vulkan::resources::MemoryPlacement;
+using engine::graphics::vulkan::resources::ResourceAllocator;
 
 struct RunOptions final {
     bool bounded = false;
@@ -130,8 +135,14 @@ bool extentDiffers(const SwapchainGeneration &generation, PixelExtent extent) {
            generation.config.extent.height != extent.height;
 }
 
+bool isSuccessfulPresent(engine::graphics::vulkan::presentation::PresentStatus status) {
+    return status == engine::graphics::vulkan::presentation::PresentStatus::success ||
+           status == engine::graphics::vulkan::presentation::PresentStatus::suboptimal;
+}
+
 GraphicsState makeGraphicsState(RenderingContext &rendering, std::span<const std::uint32_t> vertex,
-                                std::span<const std::uint32_t> fragment, VkFormat color_format) {
+                                std::span<const std::uint32_t> fragment, VkFormat color_format,
+                                VkFormat depth_format) {
     constexpr std::array push_ranges{
         PushConstantRange{.stages = VK_SHADER_STAGE_VERTEX_BIT,
                           .offset = 0,
@@ -142,7 +153,20 @@ GraphicsState makeGraphicsState(RenderingContext &rendering, std::span<const std
         .fragment_spirv = fragment,
         .push_constant_ranges = push_ranges,
         .color_format = color_format,
+        .depth_format = depth_format,
+        .depth_test_enable = true,
+        .depth_write_enable = true,
+        .depth_compare_op = VK_COMPARE_OP_LESS,
     });
+}
+
+Image createDepthImage(ResourceAllocator &allocator, VkFormat depth_format, PixelExtent extent) {
+    ImageCreateInfo info;
+    info.format = depth_format;
+    info.extent = {.width = extent.width, .height = extent.height, .depth = 1};
+    info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    info.allocation.placement = MemoryPlacement::prefer_device;
+    return allocator.createImage(info);
 }
 
 void requireShutdownIdle(VkDevice device) {
@@ -253,14 +277,14 @@ CubePush makeCubePush(const CubeInstance &cube, const Mat4 &view_proj) {
     };
 }
 
-// Overlapping cubes at different view-space depths. Draw order is near→far so
-// that without depth testing the farther cube incorrectly overwrites the nearer
-// one where they overlap on screen. That is the WP-021 hidden-surface probe.
+// Overlapping cubes at different view-space depths. Draw order is far→near so
+// correct occlusion cannot be attributed to overwrite order and must come from
+// the public depth-tested Rendering path.
 constexpr std::array kCubes{
-    CubeInstance{{-0.35F, 0.05F, -1.6F}, {1.1F, 1.1F, 1.1F}, 0.92F, 0.28F, 0.28F}, // nearer, red
     CubeInstance{{0.35F, -0.05F, -3.2F}, {1.4F, 1.4F, 1.4F}, 0.28F, 0.52F, 0.95F}, // farther, blue
-    CubeInstance{{0.0F, 0.55F, -2.4F}, {0.9F, 0.9F, 0.9F}, 0.28F, 0.78F, 0.42F},   // mid, green
     CubeInstance{{-0.8F, -0.55F, -2.8F}, {0.8F, 0.8F, 0.8F}, 0.95F, 0.78F, 0.22F}, // yellow
+    CubeInstance{{0.0F, 0.55F, -2.4F}, {0.9F, 0.9F, 0.9F}, 0.28F, 0.78F, 0.42F},   // mid, green
+    CubeInstance{{-0.35F, 0.05F, -1.6F}, {1.1F, 1.1F, 1.1F}, 0.92F, 0.28F, 0.28F}, // nearer, red
 };
 
 } // namespace
@@ -295,15 +319,22 @@ int main(int argc, char **argv) {
         const auto selected = engine::graphics::vulkan::device::selectPhysicalDevice(
             runtime.instance(), surface.handle(), runtime.applicationApiVersion());
         const engine::graphics::vulkan::logical_device::LogicalDevice logical_device{selected};
-        engine::graphics::vulkan::resources::ResourceAllocator allocator{runtime.instance(),
-                                                                         selected, logical_device};
+        ResourceAllocator allocator{runtime.instance(), selected, logical_device};
         engine::graphics::vulkan::execution::GraphicsExecutionContext execution{
             logical_device.handle(), logical_device.queues().graphics};
         engine::graphics::vulkan::presentation::Swapchain swapchain{
             selected.capabilities.handle, logical_device.handle(), surface.handle(),
             logical_device.queues()};
         RenderingContext rendering{selected, logical_device, allocator, execution};
+
+        const VkFormat depth_format = rendering.selectDepthAttachmentFormat();
+        if (!rendering.supportsDepthAttachmentFormat(depth_format)) {
+            throw std::runtime_error("Selected Rendering depth format failed support query.");
+        }
+
         std::optional<GraphicsState> graphics_state;
+        std::optional<Image> depth_image;
+        std::optional<ResourceDepthTarget> depth_target;
         float aspect = 1.0F;
 
         bool recreate_requested = true;
@@ -332,15 +363,23 @@ int main(int argc, char **argv) {
             }
             if (outcome.status == engine::graphics::vulkan::presentation::RecreateStatus::created) {
                 rendering.registerSwapchainGeneration(swapchain.activeGeneration());
+                rendering.waitForSubmittedWork();
+                depth_target.reset();
+                depth_image.reset();
+                const auto &active = swapchain.activeGeneration();
+                const PixelExtent depth_extent{.width = active.config.extent.width,
+                                               .height = active.config.extent.height};
+                depth_image = createDepthImage(allocator, depth_format, depth_extent);
+                depth_target = rendering.createDepthTarget({.image = &*depth_image});
                 graphics_state =
                     makeGraphicsState(rendering, vertex_spirv, fragment_spirv,
-                                      swapchain.activeGeneration().config.surface_format.format);
-                const auto &active = swapchain.activeGeneration();
+                                      active.config.surface_format.format, depth_format);
                 aspect = static_cast<float>(active.config.extent.width) /
                          static_cast<float>(active.config.extent.height);
                 std::cout << "Swapchain generation active: " << active.id
                           << " extent=" << active.config.extent.width << 'x'
                           << active.config.extent.height << " aspect=" << aspect
+                          << " depth_format=" << depth_format
                           << " images=" << active.images.size() << '\n';
             }
             return outcome;
@@ -361,9 +400,9 @@ int main(int argc, char **argv) {
                   << VK_API_VERSION_MINOR(selected.capabilities.effective_api_version)
                   << ") validation=" << (runtime.validationEnabled() ? "enabled" : "disabled")
                   << '\n';
-        std::cout << "cubes=" << kCubes.size() << '\n';
-        std::cout << "hidden_surface_probe=draw_order_near_to_far "
-                     "(expect incorrect occlusion without depth)\n";
+        std::cout << "cubes=" << kCubes.size() << " depth_format=" << depth_format << '\n';
+        std::cout << "hidden_surface_probe=draw_order_far_to_near "
+                     "(expect correct nearer-over-farther occlusion with depth)\n";
 
         const Mat4 view = lookAt({0.0F, 0.35F, 1.8F}, {0.0F, 0.0F, -2.2F}, {0.0F, 1.0F, 0.0F});
 
@@ -417,7 +456,8 @@ int main(int argc, char **argv) {
                 engine::graphics::vulkan::presentation::AcquireStatus::surface_lost) {
                 throw std::runtime_error("Presentation surface was lost during image acquisition.");
             }
-            if (!acquired.image.has_value() || !graphics_state.has_value()) {
+            if (!acquired.image.has_value() || !graphics_state.has_value() ||
+                !depth_target.has_value()) {
                 throw std::logic_error("Rendering acquire succeeded without frame state.");
             }
             if (acquired.status ==
@@ -456,10 +496,13 @@ int main(int argc, char **argv) {
                 .load_op = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .store_op = VK_ATTACHMENT_STORE_OP_STORE,
                 .clear_color = clear,
+                .depth_target = &*depth_target,
+                .depth_load_op = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .depth_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                .clear_depth = 1.0F,
             };
 
             const auto frame = rendering.renderAndPresent(swapchain, *acquired.image, pass);
-            ++rendered_frames;
             if (frame.present.status ==
                 engine::graphics::vulkan::presentation::PresentStatus::surface_lost) {
                 throw std::runtime_error(
@@ -471,6 +514,10 @@ int main(int argc, char **argv) {
                     engine::graphics::vulkan::presentation::PresentStatus::out_of_date) {
                 recreate_requested = true;
             }
+            if (!isSuccessfulPresent(frame.present.status)) {
+                continue;
+            }
+            ++rendered_frames;
             if (options.bounded) {
                 std::cout << "frame=" << rendered_frames
                           << " generation=" << acquired.image->generation
@@ -484,11 +531,13 @@ int main(int argc, char **argv) {
              rendering.collectRetiredSwapchainGenerations(swapchain)) {
             std::cout << "Retired swapchain generation destroyed: " << generation << '\n';
         }
+        depth_target.reset();
+        depth_image.reset();
         requireShutdownIdle(logical_device.handle());
 
         std::cout << "game_3d=passed frames=" << rendered_frames << " cubes=" << kCubes.size()
                   << (options.bounded ? " mode=bounded\n" : " mode=interactive\n");
-        std::cout << "occlusion=not_verified_public_contract_has_no_depth\n";
+        std::cout << "occlusion=depth_tested_nearer_wins\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "game_3d=failed: " << error.what() << '\n';
