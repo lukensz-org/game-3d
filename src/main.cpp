@@ -277,14 +277,15 @@ CubePush makeCubePush(const CubeInstance &cube, const Mat4 &view_proj) {
     };
 }
 
-// Overlapping cubes at different view-space depths. Draw order is far→near so
-// correct occlusion cannot be attributed to overwrite order and must come from
-// the public depth-tested Rendering path.
+// Overlapping cubes at different view-space depths. Draw order is near→far so
+// the probe is depth-adversarial: without depth testing/writing, later farther
+// draws would incorrectly overwrite nearer geometry where they overlap. With a
+// working public depth path, nearer geometry must still occlude farther geometry.
 constexpr std::array kCubes{
-    CubeInstance{{0.35F, -0.05F, -3.2F}, {1.4F, 1.4F, 1.4F}, 0.28F, 0.52F, 0.95F}, // farther, blue
-    CubeInstance{{-0.8F, -0.55F, -2.8F}, {0.8F, 0.8F, 0.8F}, 0.95F, 0.78F, 0.22F}, // yellow
-    CubeInstance{{0.0F, 0.55F, -2.4F}, {0.9F, 0.9F, 0.9F}, 0.28F, 0.78F, 0.42F},   // mid, green
     CubeInstance{{-0.35F, 0.05F, -1.6F}, {1.1F, 1.1F, 1.1F}, 0.92F, 0.28F, 0.28F}, // nearer, red
+    CubeInstance{{0.0F, 0.55F, -2.4F}, {0.9F, 0.9F, 0.9F}, 0.28F, 0.78F, 0.42F},   // mid, green
+    CubeInstance{{-0.8F, -0.55F, -2.8F}, {0.8F, 0.8F, 0.8F}, 0.95F, 0.78F, 0.22F}, // yellow
+    CubeInstance{{0.35F, -0.05F, -3.2F}, {1.4F, 1.4F, 1.4F}, 0.28F, 0.52F, 0.95F}, // farther, blue
 };
 
 } // namespace
@@ -401,8 +402,8 @@ int main(int argc, char **argv) {
                   << ") validation=" << (runtime.validationEnabled() ? "enabled" : "disabled")
                   << '\n';
         std::cout << "cubes=" << kCubes.size() << " depth_format=" << depth_format << '\n';
-        std::cout << "hidden_surface_probe=draw_order_far_to_near "
-                     "(expect correct nearer-over-farther occlusion with depth)\n";
+        std::cout << "hidden_surface_probe=draw_order_near_to_far_adversarial "
+                     "(without depth farther overwrites; with depth nearer still wins)\n";
 
         const Mat4 view = lookAt({0.0F, 0.35F, 1.8F}, {0.0F, 0.0F, -2.2F}, {0.0F, 1.0F, 0.0F});
 
