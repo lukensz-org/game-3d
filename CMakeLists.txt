@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 4.4)
 project(game_3d LANGUAGES CXX)
 
 find_package(
-    engine 0.2.0 EXACT CONFIG REQUIRED
+    engine 0.3.1 EXACT CONFIG REQUIRED
     COMPONENTS vulkan wsi
 )
 

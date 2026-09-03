@@ -2,32 +2,32 @@
 
 Independent 3D game consumer of the installed `engine` CMake Config package.
 
-This repository creates a real window, presents through the public engine WSI/Rendering contracts, and draws multiple simple colored 3D cubes under perspective projection with public depth-tested hidden-surface removal. Game-owned shaders, transform math, camera data, and shader compilation stay in this repository. It does not introduce a speculative Renderer3D abstraction.
+This repository creates a real window, presents through the public engine WSI/Rendering contracts, uses the public `SwapchainLifecycle` coordinator for ordinary Presentation↔Rendering lifecycle orchestration, and draws multiple simple colored 3D cubes under perspective projection with public depth-tested hidden-surface removal. Game-owned shaders, transform math, camera data, depth resources, and shader compilation stay in this repository. It does not introduce a speculative Renderer3D abstraction.
 
 ## Engine requirement
 
 This consumer is pinned to:
 
-- engine Git tag: `v0.2.0`
-- engine checkpoint: `9ef704e50cdd463212bbb61fae0f7cc96085a0d6`
-- engine CMake package: `0.2.0` exact
+- engine Git tag: `v0.3.1`
+- engine checkpoint: `2f2fe2b628f2eb4198fb94dba67dded5f34e7ef0`
+- engine CMake package: `0.3.1` exact
 
 The CMake request is:
 
 ```cmake
 find_package(
-    engine 0.2.0 EXACT CONFIG REQUIRED
+    engine 0.3.1 EXACT CONFIG REQUIRED
     COMPONENTS vulkan wsi
 )
 ```
 
-Package version `0.2.0 EXACT` is not source provenance. The consumed install must be produced from the engine commit identified by annotated tag `v0.2.0` / checkpoint `9ef704e50cdd463212bbb61fae0f7cc96085a0d6`. This project does not follow `main`, `master`, or any other moving engine branch.
+Package version `0.3.1 EXACT` is not source provenance. The consumed install must be produced from the engine commit identified by annotated tag `v0.3.1` / checkpoint `2f2fe2b628f2eb4198fb94dba67dded5f34e7ef0`. This project does not follow `main`, `master`, or any other moving engine branch.
 
 Upgrades are explicit consumer changes to a later engine release identity. They are never automatic.
 
 ## Prerequisite
 
-Install the `v0.2.0` engine tree to a prefix you control. This repository does not vendor engine source, add the engine as a subdirectory or submodule, or fetch engine source through CMake.
+Install the `v0.3.1` engine tree to a prefix you control. This repository does not vendor engine source, add the engine as a subdirectory or submodule, or fetch engine source through CMake.
 
 Supply that prefix through normal CMake package search input such as `CMAKE_PREFIX_PATH` or `engine_DIR`. Do not commit a machine-specific absolute prefix.
 
@@ -52,7 +52,7 @@ cmake --build --preset default
 ./build/game_3d
 ```
 
-`--bounded` creates the normal rendering path, presents four successful frames, and exits successfully without interaction. Omit it for interactive execution.
+`--bounded` creates the normal rendering path, presents four successfully accepted frames, and exits successfully without interaction. Omit it for interactive execution.
 
 The consumer target does not set `CXX_STANDARD` or request `cxx_std_23`. Effective C++23 compilation comes from the imported engine usage requirements.
 
@@ -60,4 +60,6 @@ The consumer target does not set `CXX_STANDARD` or request `cxx_std_23`. Effecti
 
 Cubes are generated from `gl_VertexIndex` (36 vertices) with per-draw push-constant MVP + color. Projection uses the active swapchain aspect ratio and updates after recreation.
 
-The accepted scene places overlapping cubes at different view-space depths. Draws are issued near-to-far so the probe is depth-adversarial: without depth testing/writing, later farther draws would incorrectly overwrite nearer geometry where they overlap; with a working depth path, nearer geometry must still occlude farther geometry. Hidden-surface removal uses the public `v0.2.0` Rendering depth contract: capability-selected depth format, a Resources-owned sample-count-1 depth image for the active extent, `ResourceDepthTarget`, depth-enabled graphics state with nearer-wins comparison, and `ColorPass` depth clear/attachment state. Extent-dependent depth resources are recreated with the swapchain.
+Ordinary Presentation↔Rendering recreate/acquire/present/reclamation orchestration uses the public `SwapchainLifecycle` contract. Extent-dependent 3D state remains consumer-owned: graphics state for the active color/depth formats, an extent-matched Resources depth image plus `ResourceDepthTarget`, and projection aspect. Before replacing those resources after a created swapchain generation, the consumer waits for submitted Rendering work so prior GPU use remains completion-safe.
+
+The accepted scene places overlapping cubes at different view-space depths. Draws are issued near-to-far so the probe is depth-adversarial: without depth testing/writing, later farther draws would incorrectly overwrite nearer geometry where they overlap; with a working depth path, nearer geometry must still occlude farther geometry. Hidden-surface removal uses the public Rendering depth contract: capability-selected depth format, a Resources-owned sample-count-1 depth image for the active extent, `ResourceDepthTarget`, depth-enabled graphics state with nearer-wins comparison, and `ColorPass` depth clear/attachment state.

@@ -1,5 +1,5 @@
-#include <engine/graphics/vulkan/rendering.hpp>
 #include <engine/graphics/vulkan/runtime.hpp>
+#include <engine/graphics/vulkan/swapchain_lifecycle.hpp>
 #include <engine/graphics/vulkan/wsi.hpp>
 
 #include <array>
@@ -10,7 +10,6 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
-#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -30,14 +29,16 @@
 namespace {
 
 using engine::graphics::vulkan::presentation::PixelExtent;
-using engine::graphics::vulkan::presentation::SwapchainGeneration;
 using engine::graphics::vulkan::rendering::ColorPass;
 using engine::graphics::vulkan::rendering::DrawInfo;
+using engine::graphics::vulkan::rendering::FrameAcquireDisposition;
+using engine::graphics::vulkan::rendering::FramePresentDisposition;
 using engine::graphics::vulkan::rendering::GraphicsState;
 using engine::graphics::vulkan::rendering::PushConstantRange;
 using engine::graphics::vulkan::rendering::PushConstantWrite;
 using engine::graphics::vulkan::rendering::RenderingContext;
 using engine::graphics::vulkan::rendering::ResourceDepthTarget;
+using engine::graphics::vulkan::rendering::SwapchainLifecycle;
 using engine::graphics::vulkan::resources::Image;
 using engine::graphics::vulkan::resources::ImageCreateInfo;
 using engine::graphics::vulkan::resources::MemoryPlacement;
@@ -128,16 +129,6 @@ PixelExtent toPixelExtent(engine::platform::FramebufferExtent extent) {
     }
     return {.width = static_cast<std::uint32_t>(extent.width),
             .height = static_cast<std::uint32_t>(extent.height)};
-}
-
-bool extentDiffers(const SwapchainGeneration &generation, PixelExtent extent) {
-    return generation.config.extent.width != extent.width ||
-           generation.config.extent.height != extent.height;
-}
-
-bool isSuccessfulPresent(engine::graphics::vulkan::presentation::PresentStatus status) {
-    return status == engine::graphics::vulkan::presentation::PresentStatus::success ||
-           status == engine::graphics::vulkan::presentation::PresentStatus::suboptimal;
 }
 
 GraphicsState makeGraphicsState(RenderingContext &rendering, std::span<const std::uint32_t> vertex,
@@ -327,6 +318,7 @@ int main(int argc, char **argv) {
             selected.capabilities.handle, logical_device.handle(), surface.handle(),
             logical_device.queues()};
         RenderingContext rendering{selected, logical_device, allocator, execution};
+        SwapchainLifecycle lifecycle{swapchain, rendering};
 
         const VkFormat depth_format = rendering.selectDepthAttachmentFormat();
         if (!rendering.supportsDepthAttachmentFormat(depth_format)) {
@@ -338,59 +330,58 @@ int main(int argc, char **argv) {
         std::optional<ResourceDepthTarget> depth_target;
         float aspect = 1.0F;
 
-        bool recreate_requested = true;
         std::uint32_t rendered_frames = 0;
         std::uint32_t bounded_iterations = 0;
         constexpr std::uint32_t bounded_frame_target = 4;
         constexpr std::uint32_t bounded_iteration_limit = 512;
 
-        const auto recreate = [&](PixelExtent framebuffer_extent) {
-            const std::optional<std::uint64_t> previous_generation =
-                swapchain.hasActiveGeneration()
-                    ? std::optional<std::uint64_t>{swapchain.activeGeneration().id}
-                    : std::nullopt;
-            const auto outcome = swapchain.recreate(framebuffer_extent);
-            if (previous_generation.has_value()) {
-                const bool still_active = swapchain.hasActiveGeneration() &&
-                                          swapchain.activeGeneration().id == *previous_generation;
-                if (!still_active) {
-                    rendering.retireSwapchainGeneration(*previous_generation);
-                    std::cout << "Swapchain generation retired: " << *previous_generation << '\n';
-                }
-            }
-            if (outcome.status ==
-                engine::graphics::vulkan::presentation::RecreateStatus::surface_lost) {
-                throw std::runtime_error("Presentation surface was lost during recreation.");
-            }
-            if (outcome.status == engine::graphics::vulkan::presentation::RecreateStatus::created) {
-                rendering.registerSwapchainGeneration(swapchain.activeGeneration());
-                rendering.waitForSubmittedWork();
-                depth_target.reset();
-                depth_image.reset();
-                const auto &active = swapchain.activeGeneration();
-                const PixelExtent depth_extent{.width = active.config.extent.width,
-                                               .height = active.config.extent.height};
-                depth_image = createDepthImage(allocator, depth_format, depth_extent);
-                depth_target = rendering.createDepthTarget({.image = &*depth_image});
-                graphics_state =
-                    makeGraphicsState(rendering, vertex_spirv, fragment_spirv,
-                                      active.config.surface_format.format, depth_format);
-                aspect = static_cast<float>(active.config.extent.width) /
-                         static_cast<float>(active.config.extent.height);
-                std::cout << "Swapchain generation active: " << active.id
-                          << " extent=" << active.config.extent.width << 'x'
-                          << active.config.extent.height << " aspect=" << aspect
-                          << " depth_format=" << depth_format
-                          << " images=" << active.images.size() << '\n';
-            }
-            return outcome;
+        const auto applyCreatedGeneration = [&]() {
+            // Wait before replacing caller-owned depth/graphics state that may still
+            // be referenced by previously submitted Rendering work.
+            rendering.waitForSubmittedWork();
+            depth_target.reset();
+            depth_image.reset();
+            const auto &active = lifecycle.swapchain().activeGeneration();
+            const PixelExtent depth_extent{.width = active.config.extent.width,
+                                           .height = active.config.extent.height};
+            depth_image = createDepthImage(allocator, depth_format, depth_extent);
+            depth_target = rendering.createDepthTarget({.image = &*depth_image});
+            graphics_state =
+                makeGraphicsState(rendering, vertex_spirv, fragment_spirv,
+                                  active.config.surface_format.format, depth_format);
+            aspect = static_cast<float>(active.config.extent.width) /
+                     static_cast<float>(active.config.extent.height);
+            std::cout << "Swapchain generation active: " << active.id
+                      << " extent=" << active.config.extent.width << 'x'
+                      << active.config.extent.height << " aspect=" << aspect
+                      << " depth_format=" << depth_format
+                      << " images=" << active.images.size() << '\n';
         };
+
+        const auto handleSyncOutcome =
+            [&](const std::optional<engine::graphics::vulkan::presentation::RecreateOutcome>
+                    &outcome) {
+                if (!outcome.has_value()) {
+                    return false;
+                }
+                if (outcome->status ==
+                    engine::graphics::vulkan::presentation::RecreateStatus::surface_lost) {
+                    throw std::runtime_error("Presentation surface was lost during recreation.");
+                }
+                if (outcome->status ==
+                    engine::graphics::vulkan::presentation::RecreateStatus::deferred) {
+                    return true;
+                }
+                if (outcome->status ==
+                    engine::graphics::vulkan::presentation::RecreateStatus::created) {
+                    applyCreatedGeneration();
+                }
+                return false;
+            };
 
         const PixelExtent initial_extent = toPixelExtent(window.framebufferExtent());
         if (initial_extent.width != 0U && initial_extent.height != 0U) {
-            const auto outcome = recreate(initial_extent);
-            recreate_requested =
-                outcome.status != engine::graphics::vulkan::presentation::RecreateStatus::created;
+            static_cast<void>(handleSyncOutcome(lifecycle.sync(initial_extent)));
         }
 
         const ShutdownIdleGuard shutdown_idle{logical_device.handle()};
@@ -423,47 +414,28 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            if (swapchain.hasActiveGeneration() &&
-                extentDiffers(swapchain.activeGeneration(), framebuffer_extent)) {
-                recreate_requested = true;
-            }
-            if (recreate_requested || !swapchain.hasActiveGeneration()) {
-                const auto outcome = recreate(framebuffer_extent);
-                if (outcome.status ==
-                    engine::graphics::vulkan::presentation::RecreateStatus::deferred) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds{8});
-                    continue;
-                }
-                recreate_requested = false;
+            if (handleSyncOutcome(lifecycle.sync(framebuffer_extent))) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{8});
+                continue;
             }
 
-            for (const std::uint64_t generation :
-                 rendering.collectRetiredSwapchainGenerations(swapchain)) {
+            for (const std::uint64_t generation : lifecycle.reclaimRetiredGenerations()) {
                 std::cout << "Retired swapchain generation destroyed: " << generation << '\n';
             }
 
-            const auto acquired = rendering.acquireNextImage(swapchain);
-            if (acquired.status ==
-                    engine::graphics::vulkan::presentation::AcquireStatus::not_ready ||
-                acquired.status == engine::graphics::vulkan::presentation::AcquireStatus::timeout) {
+            const auto acquired = lifecycle.acquire();
+            if (acquired.disposition == FrameAcquireDisposition::try_again) {
                 continue;
             }
-            if (acquired.status ==
-                engine::graphics::vulkan::presentation::AcquireStatus::out_of_date) {
-                recreate_requested = true;
+            if (acquired.disposition == FrameAcquireDisposition::recreate_required) {
                 continue;
             }
-            if (acquired.status ==
-                engine::graphics::vulkan::presentation::AcquireStatus::surface_lost) {
+            if (acquired.disposition == FrameAcquireDisposition::surface_lost) {
                 throw std::runtime_error("Presentation surface was lost during image acquisition.");
             }
             if (!acquired.image.has_value() || !graphics_state.has_value() ||
                 !depth_target.has_value()) {
                 throw std::logic_error("Rendering acquire succeeded without frame state.");
-            }
-            if (acquired.status ==
-                engine::graphics::vulkan::presentation::AcquireStatus::suboptimal) {
-                recreate_requested = true;
             }
 
             const Mat4 proj = perspective(0.785398163F, aspect, 0.1F, 32.0F);
@@ -503,19 +475,15 @@ int main(int argc, char **argv) {
                 .clear_depth = 1.0F,
             };
 
-            const auto frame = rendering.renderAndPresent(swapchain, *acquired.image, pass);
-            if (frame.present.status ==
-                engine::graphics::vulkan::presentation::PresentStatus::surface_lost) {
+            const auto frame = lifecycle.renderAndPresent(*acquired.image, pass);
+            if (frame.disposition == FramePresentDisposition::surface_lost) {
                 throw std::runtime_error(
                     "Presentation surface was lost during queue presentation.");
             }
-            if (frame.present.status ==
-                    engine::graphics::vulkan::presentation::PresentStatus::suboptimal ||
-                frame.present.status ==
-                    engine::graphics::vulkan::presentation::PresentStatus::out_of_date) {
-                recreate_requested = true;
+            if (frame.disposition == FramePresentDisposition::recreate_required) {
+                continue;
             }
-            if (!isSuccessfulPresent(frame.present.status)) {
+            if (frame.disposition != FramePresentDisposition::accepted) {
                 continue;
             }
             ++rendered_frames;
@@ -523,13 +491,12 @@ int main(int argc, char **argv) {
                 std::cout << "frame=" << rendered_frames
                           << " generation=" << acquired.image->generation
                           << " image=" << acquired.image->image_index
-                          << " completion=" << frame.completion.value << '\n';
+                          << " completion=" << frame.frame.completion.value << '\n';
             }
         }
 
         rendering.waitForSubmittedWork();
-        for (const std::uint64_t generation :
-             rendering.collectRetiredSwapchainGenerations(swapchain)) {
+        for (const std::uint64_t generation : lifecycle.reclaimRetiredGenerations()) {
             std::cout << "Retired swapchain generation destroyed: " << generation << '\n';
         }
         depth_target.reset();
