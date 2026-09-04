@@ -3,18 +3,15 @@ cmake_minimum_required(VERSION 4.4)
 project(game_3d LANGUAGES CXX)
 
 find_package(
-    engine 0.3.1 EXACT CONFIG REQUIRED
-    COMPONENTS vulkan wsi
+    engine 0.4.0 EXACT CONFIG REQUIRED
+    COMPONENTS graphics
 )
 
-if(NOT TARGET engine::vulkan_rendering)
-    message(FATAL_ERROR "engine::vulkan_rendering was not imported by find_package(engine).")
+if(NOT TARGET engine::platform)
+    message(FATAL_ERROR "engine::platform was not imported by find_package(engine).")
 endif()
-if(NOT TARGET engine::vulkan_wsi)
-    message(FATAL_ERROR "engine::vulkan_wsi was not imported by find_package(engine).")
-endif()
-if(NOT TARGET engine::vulkan_runtime)
-    message(FATAL_ERROR "engine::vulkan_runtime was not imported by find_package(engine).")
+if(NOT TARGET engine::vulkan_graphics)
+    message(FATAL_ERROR "engine::vulkan_graphics was not imported by find_package(engine).")
 endif()
 
 find_program(GAME_3D_GLSLC NAMES glslc REQUIRED)
@@ -60,7 +57,6 @@ target_compile_definitions(
 target_link_libraries(
     game_3d
     PRIVATE
-        engine::vulkan_runtime
-        engine::vulkan_wsi
-        engine::vulkan_rendering
+        engine::platform
+        engine::vulkan_graphics
 )
