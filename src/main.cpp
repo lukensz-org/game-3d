@@ -27,12 +27,13 @@
 
 namespace {
 
+using engine::graphics::vulkan::FrameBeginDisposition;
+using engine::graphics::vulkan::FrameBeginResult;
+using engine::graphics::vulkan::FrameEndDisposition;
 using engine::graphics::vulkan::GraphicsContext;
 using engine::graphics::vulkan::presentation::PixelExtent;
 using engine::graphics::vulkan::rendering::ColorPass;
 using engine::graphics::vulkan::rendering::DrawInfo;
-using engine::graphics::vulkan::rendering::FrameAcquireDisposition;
-using engine::graphics::vulkan::rendering::FramePresentDisposition;
 using engine::graphics::vulkan::rendering::GraphicsState;
 using engine::graphics::vulkan::rendering::PushConstantRange;
 using engine::graphics::vulkan::rendering::PushConstantWrite;
@@ -267,8 +268,10 @@ int main(int argc, char **argv) {
         }
 
         std::optional<GraphicsState> graphics_state;
+        std::optional<VkFormat> graphics_state_color_format;
         std::optional<Image> depth_image;
         std::optional<ResourceDepthTarget> depth_target;
+        std::optional<PixelExtent> depth_extent;
         float aspect = 1.0F;
 
         std::uint32_t rendered_frames = 0;
@@ -276,54 +279,51 @@ int main(int argc, char **argv) {
         constexpr std::uint32_t bounded_frame_target = 4;
         constexpr std::uint32_t bounded_iteration_limit = 512;
 
-        const auto applyCreatedGeneration = [&]() {
-            // Wait before replacing caller-owned depth/graphics state that may still
-            // be referenced by previously submitted Rendering work.
-            graphics.waitForSubmittedWork();
-            graphics_state.reset();
-            depth_target.reset();
-            depth_image.reset();
-
-            const PixelExtent extent = graphics.extent();
-            if (extent.width == 0U || extent.height == 0U) {
-                throw std::logic_error("Created presentation generation has zero extent.");
+        const auto applyReadyFrame = [&](const FrameBeginResult &frame) {
+            if (frame.disposition != FrameBeginDisposition::ready) {
+                throw std::logic_error("Frame state requires a ready begin result.");
+            }
+            if (frame.extent.width == 0U || frame.extent.height == 0U ||
+                frame.color_format == VK_FORMAT_UNDEFINED) {
+                throw std::logic_error("Ready frame reported invalid presentation state.");
             }
 
-            depth_image = createDepthImage(graphics.resources(), depth_format, extent);
-            depth_target = graphics.createDepthTarget({.image = &*depth_image});
-            graphics_state = makeGraphicsState(graphics, vertex_spirv, fragment_spirv,
-                                               graphics.colorFormat(), depth_format);
-            aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-            std::cout << "Swapchain generation active: " << graphics.generationId()
-                      << " extent=" << extent.width << 'x' << extent.height << " aspect=" << aspect
-                      << " depth_format=" << depth_format << '\n';
+            const bool replace_graphics_state =
+                !graphics_state.has_value() || !graphics_state_color_format.has_value() ||
+                *graphics_state_color_format != frame.color_format;
+            const bool replace_depth =
+                !depth_image.has_value() || !depth_target.has_value() || !depth_extent.has_value() ||
+                depth_extent->width != frame.extent.width || depth_extent->height != frame.extent.height;
+
+            const bool existing_graphics_replaced = replace_graphics_state && graphics_state.has_value();
+            const bool existing_depth_replaced =
+                replace_depth && (depth_target.has_value() || depth_image.has_value());
+            if (existing_graphics_replaced || existing_depth_replaced) {
+                graphics.waitForSubmittedWork();
+            }
+
+            if (replace_graphics_state) {
+                graphics_state.reset();
+                graphics_state = makeGraphicsState(graphics, vertex_spirv, fragment_spirv,
+                                                   frame.color_format, depth_format);
+                graphics_state_color_format = frame.color_format;
+            }
+
+            if (replace_depth) {
+                depth_target.reset();
+                depth_image.reset();
+                depth_image = createDepthImage(graphics.resources(), depth_format, frame.extent);
+                depth_target = graphics.createDepthTarget({.image = &*depth_image});
+                depth_extent = frame.extent;
+            }
+
+            aspect = static_cast<float>(frame.extent.width) / static_cast<float>(frame.extent.height);
+            if (frame.generation_changed) {
+                std::cout << "Swapchain generation active: " << frame.generation
+                          << " extent=" << frame.extent.width << 'x' << frame.extent.height
+                          << " aspect=" << aspect << " depth_format=" << depth_format << '\n';
+            }
         };
-
-        const auto handleSyncOutcome =
-            [&](const std::optional<engine::graphics::vulkan::presentation::RecreateOutcome>
-                    &outcome) {
-                if (!outcome.has_value()) {
-                    return false;
-                }
-                if (outcome->status ==
-                    engine::graphics::vulkan::presentation::RecreateStatus::surface_lost) {
-                    throw std::runtime_error("Presentation surface was lost during recreation.");
-                }
-                if (outcome->status ==
-                    engine::graphics::vulkan::presentation::RecreateStatus::deferred) {
-                    return true;
-                }
-                if (outcome->status ==
-                    engine::graphics::vulkan::presentation::RecreateStatus::created) {
-                    applyCreatedGeneration();
-                }
-                return false;
-            };
-
-        const auto initial_extent = window.framebufferExtent();
-        if (initial_extent.width > 0 && initial_extent.height > 0) {
-            static_cast<void>(handleSyncOutcome(graphics.sync(initial_extent)));
-        }
 
         const std::uint32_t api_version = graphics.applicationApiVersion();
         std::cout << "game-3d initialized: " << graphics.deviceName() << " (API "
@@ -345,34 +345,26 @@ int main(int argc, char **argv) {
             }
 
             window_system.pollEvents();
-            const auto framebuffer_extent = window.framebufferExtent();
-            if (framebuffer_extent.width <= 0 || framebuffer_extent.height <= 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds{8});
-                continue;
-            }
-
-            if (handleSyncOutcome(graphics.sync(framebuffer_extent))) {
-                std::this_thread::sleep_for(std::chrono::milliseconds{8});
-                continue;
-            }
-
-            for (const std::uint64_t generation : graphics.reclaimRetiredGenerations()) {
+            const auto frame = graphics.beginFrame(window.framebufferExtent());
+            for (const std::uint64_t generation : frame.reclaimed_generations) {
                 std::cout << "Retired swapchain generation destroyed: " << generation << '\n';
             }
 
-            const auto acquired = graphics.acquire();
-            if (acquired.disposition == FrameAcquireDisposition::try_again) {
+            switch (frame.disposition) {
+            case FrameBeginDisposition::deferred:
+                std::this_thread::sleep_for(std::chrono::milliseconds{8});
                 continue;
-            }
-            if (acquired.disposition == FrameAcquireDisposition::recreate_required) {
+            case FrameBeginDisposition::try_again:
                 continue;
+            case FrameBeginDisposition::surface_lost:
+                throw std::runtime_error("Presentation surface was lost while beginning a frame.");
+            case FrameBeginDisposition::ready:
+                break;
             }
-            if (acquired.disposition == FrameAcquireDisposition::surface_lost) {
-                throw std::runtime_error("Presentation surface was lost during image acquisition.");
-            }
-            if (!acquired.image.has_value() || !graphics_state.has_value() ||
-                !depth_target.has_value()) {
-                throw std::logic_error("Rendering acquire succeeded without frame state.");
+
+            applyReadyFrame(frame);
+            if (!graphics_state.has_value() || !depth_target.has_value()) {
+                throw std::logic_error("Ready frame has no compatible depth-capable frame state.");
             }
 
             const Mat4 proj = perspective(0.785398163F, aspect, 0.1F, 32.0F);
@@ -412,30 +404,25 @@ int main(int argc, char **argv) {
                 .clear_depth = 1.0F,
             };
 
-            const auto frame = graphics.renderAndPresent(*acquired.image, pass);
-            if (frame.disposition == FramePresentDisposition::surface_lost) {
-                throw std::runtime_error(
-                    "Presentation surface was lost during queue presentation.");
-            }
-            if (frame.disposition == FramePresentDisposition::recreate_required) {
+            const auto presented = graphics.presentFrame(pass);
+            switch (presented.disposition) {
+            case FrameEndDisposition::surface_lost:
+                throw std::runtime_error("Presentation surface was lost during queue presentation.");
+            case FrameEndDisposition::try_again:
                 continue;
+            case FrameEndDisposition::accepted:
+                break;
             }
-            if (frame.disposition != FramePresentDisposition::accepted) {
-                continue;
-            }
+
             ++rendered_frames;
             if (options.bounded) {
-                std::cout << "frame=" << rendered_frames
-                          << " generation=" << acquired.image->generation
-                          << " image=" << acquired.image->image_index
-                          << " completion=" << frame.frame.completion.value << '\n';
+                std::cout << "frame=" << rendered_frames << " generation=" << frame.generation
+                          << " image=" << frame.image_index
+                          << " completion=" << presented.completion.value << '\n';
             }
         }
 
         graphics.waitForSubmittedWork();
-        for (const std::uint64_t generation : graphics.reclaimRetiredGenerations()) {
-            std::cout << "Retired swapchain generation destroyed: " << generation << '\n';
-        }
         graphics_state.reset();
         depth_target.reset();
         depth_image.reset();
