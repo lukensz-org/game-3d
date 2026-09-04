@@ -1,6 +1,5 @@
-#include <engine/graphics/vulkan/runtime.hpp>
-#include <engine/graphics/vulkan/swapchain_lifecycle.hpp>
-#include <engine/graphics/vulkan/wsi.hpp>
+#include <engine/graphics/vulkan/graphics.hpp>
+#include <engine/platform/window.hpp>
 
 #include <array>
 #include <chrono>
@@ -28,6 +27,7 @@
 
 namespace {
 
+using engine::graphics::vulkan::GraphicsContext;
 using engine::graphics::vulkan::presentation::PixelExtent;
 using engine::graphics::vulkan::rendering::ColorPass;
 using engine::graphics::vulkan::rendering::DrawInfo;
@@ -36,9 +36,7 @@ using engine::graphics::vulkan::rendering::FramePresentDisposition;
 using engine::graphics::vulkan::rendering::GraphicsState;
 using engine::graphics::vulkan::rendering::PushConstantRange;
 using engine::graphics::vulkan::rendering::PushConstantWrite;
-using engine::graphics::vulkan::rendering::RenderingContext;
 using engine::graphics::vulkan::rendering::ResourceDepthTarget;
-using engine::graphics::vulkan::rendering::SwapchainLifecycle;
 using engine::graphics::vulkan::resources::Image;
 using engine::graphics::vulkan::resources::ImageCreateInfo;
 using engine::graphics::vulkan::resources::MemoryPlacement;
@@ -77,22 +75,6 @@ struct CubeInstance final {
     float color_b = 1.0F;
 };
 
-class ShutdownIdleGuard final {
-  public:
-    explicit ShutdownIdleGuard(VkDevice device) : device_(device) {}
-    ~ShutdownIdleGuard() {
-        if (device_ != VK_NULL_HANDLE) {
-            static_cast<void>(vkDeviceWaitIdle(device_));
-        }
-    }
-
-    ShutdownIdleGuard(const ShutdownIdleGuard &) = delete;
-    ShutdownIdleGuard &operator=(const ShutdownIdleGuard &) = delete;
-
-  private:
-    VkDevice device_ = VK_NULL_HANDLE;
-};
-
 RunOptions parseOptions(int argc, char **argv) {
     RunOptions options;
     for (int index = 1; index < argc; ++index) {
@@ -123,15 +105,8 @@ std::vector<std::uint32_t> loadSpirv(const char *path) {
     return words;
 }
 
-PixelExtent toPixelExtent(engine::platform::FramebufferExtent extent) {
-    if (extent.width <= 0 || extent.height <= 0) {
-        return {};
-    }
-    return {.width = static_cast<std::uint32_t>(extent.width),
-            .height = static_cast<std::uint32_t>(extent.height)};
-}
-
-GraphicsState makeGraphicsState(RenderingContext &rendering, std::span<const std::uint32_t> vertex,
+GraphicsState makeGraphicsState(const GraphicsContext &graphics,
+                                std::span<const std::uint32_t> vertex,
                                 std::span<const std::uint32_t> fragment, VkFormat color_format,
                                 VkFormat depth_format) {
     constexpr std::array push_ranges{
@@ -139,7 +114,7 @@ GraphicsState makeGraphicsState(RenderingContext &rendering, std::span<const std
                           .offset = 0,
                           .size = static_cast<std::uint32_t>(sizeof(CubePush))},
     };
-    return rendering.createGraphicsState({
+    return graphics.createGraphicsState({
         .vertex_spirv = vertex,
         .fragment_spirv = fragment,
         .push_constant_ranges = push_ranges,
@@ -158,14 +133,6 @@ Image createDepthImage(ResourceAllocator &allocator, VkFormat depth_format, Pixe
     info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     info.allocation.placement = MemoryPlacement::prefer_device;
     return allocator.createImage(info);
-}
-
-void requireShutdownIdle(VkDevice device) {
-    const VkResult result = vkDeviceWaitIdle(device);
-    if (result != VK_SUCCESS) {
-        throw std::runtime_error("vkDeviceWaitIdle(shutdown) failed with VkResult " +
-                                 std::to_string(static_cast<int>(result)));
-    }
 }
 
 Mat4 identity() {
@@ -288,40 +255,14 @@ int main(int argc, char **argv) {
         const auto fragment_spirv = loadSpirv(GAME_3D_FRAGMENT_SPV);
 
         engine::platform::WindowSystem window_system;
-        const auto wsi_requirements =
-            engine::graphics::vulkan::wsi::queryInstanceRequirements(window_system);
-        const auto presentation_requirements =
-            engine::graphics::vulkan::presentation::queryInstanceRequirements();
-        const auto wsi_views = wsi_requirements.views();
-        const auto presentation_views = presentation_requirements.views();
-        std::vector<std::string_view> required_extensions;
-        required_extensions.reserve(wsi_views.size() + presentation_views.size());
-        required_extensions.insert(required_extensions.end(), wsi_views.begin(), wsi_views.end());
-        required_extensions.insert(required_extensions.end(), presentation_views.begin(),
-                                   presentation_views.end());
-        const engine::graphics::vulkan::Runtime runtime{
-            {.required_instance_extensions =
-                 std::span<const std::string_view>{required_extensions}}};
-
         engine::platform::WindowConfig config;
         config.title = "game-3d";
         config.visible = !options.bounded;
         const engine::platform::Window window{window_system, config};
-        const engine::graphics::vulkan::wsi::Surface surface{runtime.instance(), window};
-        const auto selected = engine::graphics::vulkan::device::selectPhysicalDevice(
-            runtime.instance(), surface.handle(), runtime.applicationApiVersion());
-        const engine::graphics::vulkan::logical_device::LogicalDevice logical_device{selected};
-        ResourceAllocator allocator{runtime.instance(), selected, logical_device};
-        engine::graphics::vulkan::execution::GraphicsExecutionContext execution{
-            logical_device.handle(), logical_device.queues().graphics};
-        engine::graphics::vulkan::presentation::Swapchain swapchain{
-            selected.capabilities.handle, logical_device.handle(), surface.handle(),
-            logical_device.queues()};
-        RenderingContext rendering{selected, logical_device, allocator, execution};
-        SwapchainLifecycle lifecycle{swapchain, rendering};
+        GraphicsContext graphics{window_system, window};
 
-        const VkFormat depth_format = rendering.selectDepthAttachmentFormat();
-        if (!rendering.supportsDepthAttachmentFormat(depth_format)) {
+        const VkFormat depth_format = graphics.selectDepthAttachmentFormat();
+        if (!graphics.supportsDepthAttachmentFormat(depth_format)) {
             throw std::runtime_error("Selected Rendering depth format failed support query.");
         }
 
@@ -338,24 +279,24 @@ int main(int argc, char **argv) {
         const auto applyCreatedGeneration = [&]() {
             // Wait before replacing caller-owned depth/graphics state that may still
             // be referenced by previously submitted Rendering work.
-            rendering.waitForSubmittedWork();
+            graphics.waitForSubmittedWork();
+            graphics_state.reset();
             depth_target.reset();
             depth_image.reset();
-            const auto &active = lifecycle.swapchain().activeGeneration();
-            const PixelExtent depth_extent{.width = active.config.extent.width,
-                                           .height = active.config.extent.height};
-            depth_image = createDepthImage(allocator, depth_format, depth_extent);
-            depth_target = rendering.createDepthTarget({.image = &*depth_image});
-            graphics_state =
-                makeGraphicsState(rendering, vertex_spirv, fragment_spirv,
-                                  active.config.surface_format.format, depth_format);
-            aspect = static_cast<float>(active.config.extent.width) /
-                     static_cast<float>(active.config.extent.height);
-            std::cout << "Swapchain generation active: " << active.id
-                      << " extent=" << active.config.extent.width << 'x'
-                      << active.config.extent.height << " aspect=" << aspect
-                      << " depth_format=" << depth_format
-                      << " images=" << active.images.size() << '\n';
+
+            const PixelExtent extent = graphics.extent();
+            if (extent.width == 0U || extent.height == 0U) {
+                throw std::logic_error("Created presentation generation has zero extent.");
+            }
+
+            depth_image = createDepthImage(graphics.resources(), depth_format, extent);
+            depth_target = graphics.createDepthTarget({.image = &*depth_image});
+            graphics_state = makeGraphicsState(graphics, vertex_spirv, fragment_spirv,
+                                               graphics.colorFormat(), depth_format);
+            aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+            std::cout << "Swapchain generation active: " << graphics.generationId()
+                      << " extent=" << extent.width << 'x' << extent.height << " aspect=" << aspect
+                      << " depth_format=" << depth_format << '\n';
         };
 
         const auto handleSyncOutcome =
@@ -379,19 +320,15 @@ int main(int argc, char **argv) {
                 return false;
             };
 
-        const PixelExtent initial_extent = toPixelExtent(window.framebufferExtent());
-        if (initial_extent.width != 0U && initial_extent.height != 0U) {
-            static_cast<void>(handleSyncOutcome(lifecycle.sync(initial_extent)));
+        const auto initial_extent = window.framebufferExtent();
+        if (initial_extent.width > 0 && initial_extent.height > 0) {
+            static_cast<void>(handleSyncOutcome(graphics.sync(initial_extent)));
         }
 
-        const ShutdownIdleGuard shutdown_idle{logical_device.handle()};
-        static_cast<void>(shutdown_idle);
-
-        std::cout << "game-3d initialized: " << selected.capabilities.name << " (API "
-                  << VK_API_VERSION_MAJOR(selected.capabilities.effective_api_version) << '.'
-                  << VK_API_VERSION_MINOR(selected.capabilities.effective_api_version)
-                  << ") validation=" << (runtime.validationEnabled() ? "enabled" : "disabled")
-                  << '\n';
+        const std::uint32_t api_version = graphics.applicationApiVersion();
+        std::cout << "game-3d initialized: " << graphics.deviceName() << " (API "
+                  << VK_API_VERSION_MAJOR(api_version) << '.' << VK_API_VERSION_MINOR(api_version)
+                  << ")\n";
         std::cout << "cubes=" << kCubes.size() << " depth_format=" << depth_format << '\n';
         std::cout << "hidden_surface_probe=draw_order_near_to_far_adversarial "
                      "(without depth farther overwrites; with depth nearer still wins)\n";
@@ -408,22 +345,22 @@ int main(int argc, char **argv) {
             }
 
             window_system.pollEvents();
-            const PixelExtent framebuffer_extent = toPixelExtent(window.framebufferExtent());
-            if (framebuffer_extent.width == 0U || framebuffer_extent.height == 0U) {
+            const auto framebuffer_extent = window.framebufferExtent();
+            if (framebuffer_extent.width <= 0 || framebuffer_extent.height <= 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds{8});
                 continue;
             }
 
-            if (handleSyncOutcome(lifecycle.sync(framebuffer_extent))) {
+            if (handleSyncOutcome(graphics.sync(framebuffer_extent))) {
                 std::this_thread::sleep_for(std::chrono::milliseconds{8});
                 continue;
             }
 
-            for (const std::uint64_t generation : lifecycle.reclaimRetiredGenerations()) {
+            for (const std::uint64_t generation : graphics.reclaimRetiredGenerations()) {
                 std::cout << "Retired swapchain generation destroyed: " << generation << '\n';
             }
 
-            const auto acquired = lifecycle.acquire();
+            const auto acquired = graphics.acquire();
             if (acquired.disposition == FrameAcquireDisposition::try_again) {
                 continue;
             }
@@ -475,7 +412,7 @@ int main(int argc, char **argv) {
                 .clear_depth = 1.0F,
             };
 
-            const auto frame = lifecycle.renderAndPresent(*acquired.image, pass);
+            const auto frame = graphics.renderAndPresent(*acquired.image, pass);
             if (frame.disposition == FramePresentDisposition::surface_lost) {
                 throw std::runtime_error(
                     "Presentation surface was lost during queue presentation.");
@@ -495,13 +432,13 @@ int main(int argc, char **argv) {
             }
         }
 
-        rendering.waitForSubmittedWork();
-        for (const std::uint64_t generation : lifecycle.reclaimRetiredGenerations()) {
+        graphics.waitForSubmittedWork();
+        for (const std::uint64_t generation : graphics.reclaimRetiredGenerations()) {
             std::cout << "Retired swapchain generation destroyed: " << generation << '\n';
         }
+        graphics_state.reset();
         depth_target.reset();
         depth_image.reset();
-        requireShutdownIdle(logical_device.handle());
 
         std::cout << "game_3d=passed frames=" << rendered_frames << " cubes=" << kCubes.size()
                   << (options.bounded ? " mode=bounded\n" : " mode=interactive\n");
