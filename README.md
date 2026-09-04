@@ -2,36 +2,41 @@
 
 Independent 3D game consumer of the installed `engine` CMake Config package.
 
-This repository creates a real window, presents through the public engine WSI/Rendering contracts, uses the public `SwapchainLifecycle` coordinator for ordinary Presentation↔Rendering lifecycle orchestration, and draws multiple simple colored 3D cubes under perspective projection with public depth-tested hidden-surface removal. Game-owned shaders, transform math, camera data, depth resources, and shader compilation stay in this repository. It does not introduce a speculative Renderer3D abstraction.
+This repository creates a real Platform window, uses the public `GraphicsContext` facade for ordinary windowed Vulkan bootstrap and presentation/rendering lifecycle orchestration, and draws multiple simple colored 3D cubes under perspective projection with public depth-tested hidden-surface removal. Game-owned shaders, shader compilation, transform math, camera/scene data, depth resources, projection/aspect policy, workload, and game-loop policy stay in this repository. It does not introduce a speculative Renderer3D abstraction.
 
 ## Engine requirement
 
 This consumer is pinned to:
 
-- engine Git tag: `v0.3.1`
-- engine checkpoint: `2f2fe2b628f2eb4198fb94dba67dded5f34e7ef0`
-- engine CMake package: `0.3.1` exact
+- engine checkpoint: `ac17a6d9016e2f87e36c92683df5748e9cb82fc7`
+- engine CMake package: `0.4.0` exact
+- engine package component: `graphics`
+
+There is no annotated `v0.4.0` tag for this package boundary. Package version `0.4.0 EXACT` is not source provenance by itself; the consumed install must be produced from exact engine checkpoint `ac17a6d9016e2f87e36c92683df5748e9cb82fc7`, which contains the validated hardened `GraphicsContext` implementation. This project does not follow `main`, `master`, or any other moving engine branch.
 
 The CMake request is:
 
 ```cmake
 find_package(
-    engine 0.3.1 EXACT CONFIG REQUIRED
-    COMPONENTS vulkan wsi
+    engine 0.4.0 EXACT CONFIG REQUIRED
+    COMPONENTS graphics
 )
 ```
 
-Package version `0.3.1 EXACT` is not source provenance. The consumed install must be produced from the engine commit identified by annotated tag `v0.3.1` / checkpoint `2f2fe2b628f2eb4198fb94dba67dded5f34e7ef0`. This project does not follow `main`, `master`, or any other moving engine branch.
+The executable links the documented ordinary game target boundary:
 
-Upgrades are explicit consumer changes to a later engine release identity. They are never automatic.
+- `engine::platform`
+- `engine::vulkan_graphics`
+
+Upgrades are explicit consumer changes to a later validated engine package/provenance identity. They are never automatic.
 
 ## Prerequisite
 
-Install the `v0.3.1` engine tree to a prefix you control. This repository does not vendor engine source, add the engine as a subdirectory or submodule, or fetch engine source through CMake.
+Install the exact engine checkpoint above to a prefix you control. This repository does not vendor engine source, add the engine as a subdirectory or submodule, or fetch engine source through CMake.
 
 Supply that prefix through normal CMake package search input such as `CMAKE_PREFIX_PATH` or `engine_DIR`. Do not commit a machine-specific absolute prefix.
 
-The `vulkan` and `wsi` components require:
+The installed `graphics` component requires:
 
 - a CMake-resolvable Vulkan 1.3+ development package;
 - a CMake-resolvable GLFW package (`glfw3` >= 3.5.1);
@@ -39,7 +44,7 @@ The `vulkan` and `wsi` components require:
 
 Shader tooling is a `game-3d` build requirement. It is not exported by the installed engine package.
 
-For Debug Khronos validation evidence, consume an engine package built in Debug so the installed Runtime retains validation-enabled behavior.
+For Debug Khronos validation evidence, consume an engine package built in Debug so the facade's owned Runtime retains validation-enabled behavior.
 
 ## Configure, build, and run
 
@@ -56,10 +61,29 @@ cmake --build --preset default
 
 The consumer target does not set `CXX_STANDARD` or request `cxx_std_23`. Effective C++23 compilation comes from the imported engine usage requirements.
 
+## GraphicsContext boundary
+
+`engine::graphics::vulkan::GraphicsContext` is constructed from the caller-owned `engine::platform::WindowSystem` and `Window`. It owns the common Runtime, Surface, device, allocator, execution, swapchain, RenderingContext, and `SwapchainLifecycle` bootstrap/teardown chain.
+
+The consumer uses the facade for:
+
+- presentation extent synchronization and recreation observation;
+- retired-generation reclamation;
+- image acquisition;
+- render/present submission;
+- submitted-work completion when consumer-owned graphics/depth state must be replaced safely;
+- device/API diagnostics exposed by the facade.
+
+The consumer does not directly construct lower Vulkan bootstrap objects or `SwapchainLifecycle`, and it does not use raw `vkDeviceWaitIdle` shutdown plumbing.
+
 ## Workload and hidden-surface acceptance
 
-Cubes are generated from `gl_VertexIndex` (36 vertices) with per-draw push-constant MVP + color. Projection uses the active swapchain aspect ratio and updates after recreation.
+Cubes are generated from `gl_VertexIndex` (36 vertices) with per-draw push-constant MVP + color. Projection uses `GraphicsContext::extent()` for the active presentation aspect ratio and updates after a created generation.
 
-Ordinary Presentation↔Rendering recreate/acquire/present/reclamation orchestration uses the public `SwapchainLifecycle` contract. Extent-dependent 3D state remains consumer-owned: graphics state for the active color/depth formats, an extent-matched Resources depth image plus `ResourceDepthTarget`, and projection aspect. Before replacing those resources after a created swapchain generation, the consumer waits for submitted Rendering work so prior GPU use remains completion-safe.
+Extent-dependent 3D state remains consumer-owned: depth-enabled graphics state for the active color/depth formats, an extent-matched Resources depth image plus `ResourceDepthTarget`, and projection aspect. The depth format is selected through the public `GraphicsContext` capability surface. The depth image is created through the non-owning allocator reference returned by `GraphicsContext::resources()`, while the depth target and graphics state are created through the facade.
 
-The accepted scene places overlapping cubes at different view-space depths. Draws are issued near-to-far so the probe is depth-adversarial: without depth testing/writing, later farther draws would incorrectly overwrite nearer geometry where they overlap; with a working depth path, nearer geometry must still occlude farther geometry. Hidden-surface removal uses the public Rendering depth contract: capability-selected depth format, a Resources-owned sample-count-1 depth image for the active extent, `ResourceDepthTarget`, depth-enabled graphics state with nearer-wins comparison, and `ColorPass` depth clear/attachment state.
+Before replacing context-backed graphics/depth resources after a created presentation generation, the consumer waits for submitted Rendering work. The old depth target is destroyed before the depth image it references, and all context-backed consumer objects are destroyed before the `GraphicsContext`.
+
+The accepted scene places overlapping cubes at different view-space depths. Draws are issued near-to-far so the probe is depth-adversarial: without depth testing/writing, later farther draws would incorrectly overwrite nearer geometry where they overlap; with a working public depth path, nearer geometry must still occlude farther geometry. Hidden-surface removal uses the public Rendering depth contract: capability-selected depth format, a Resources-owned sample-count-1 depth image for the active extent, `ResourceDepthTarget`, depth-enabled graphics state with `VK_COMPARE_OP_LESS`, and `ColorPass` depth clear/attachment state.
+
+Bounded frame accounting advances only on `FramePresentDisposition::accepted`. Acquire retry/recreation outcomes and present recreation outcomes do not count as completed frames; surface loss remains a fatal observable consumer condition. Interactive resize/recreation keeps depth resources extent-matched and projection aspect current, including recovery from zero/minimized framebuffer periods without creating zero-sized depth resources.
